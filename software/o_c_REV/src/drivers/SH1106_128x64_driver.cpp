@@ -39,6 +39,9 @@ static DMAChannel page_dma;
 
 static uint8_t SH1106_data_start_seq[] = {
 // u8g_dev_ssd1306_128x64_data_start
+  0x40, /* set display start line to 0 - re-sent with every page so a
+           corrupted start line (vertical image shift) self-heals
+           within one page instead of persisting until reboot */
   0x10, /* set upper 4 bit of the col adr to 0 */
   0x02, /* set lower 4 bit of the col adr to 0 */
   0x00  /* 0xb0 | page */  
@@ -126,7 +129,18 @@ void SH1106_128x64_Driver::Init() {
 /*static*/
 void SH1106_128x64_Driver::Flush() {
 #ifdef DMA_PAGE_TRANSFER
-  // Assume DMA transfer has completed, else we're doomed
+  // A page transfer normally completes within the 60 us core-timer
+  // period, but when the applet ISR section or the DAC update runs
+  // long, the next tick can arrive while the DMA is still in flight.
+  // Truncating it mid-page is catastrophic: the leftover FIFO bytes are
+  // clocked into the OLED at whatever D/C state follows, corrupting the
+  // panel's internal state (wrong page/column, display offset, mirrored
+  // orientation) until reboot. Wait out the transfer instead - bounded,
+  // because the SPI clock is free-running (one page ~= 35-45 us) and
+  // the DMA only starts when a SendPage armed it (SPI0_RSER).
+  if (SPI0_RSER & (SPI_RSER_RFDF_RE | SPI_RSER_TFFF_RE)) {
+    while (!page_dma.complete()) ;
+  }
   digitalWriteFast(OLED_CS, OLED_CS_INACTIVE); // U8G_ESC_CS(0)
   page_dma.clearComplete();
   page_dma.disable();
@@ -142,7 +156,7 @@ static uint8_t empty_page[SH1106_128x64_Driver::kPageSize];
 void SH1106_128x64_Driver::Clear() {
   memset(empty_page, 0, sizeof(kPageSize));
 
-  SH1106_data_start_seq[2] = 0xb0 | 0;
+  SH1106_data_start_seq[3] = 0xb0 | 0;
   digitalWriteFast(OLED_DC, LOW);
   digitalWriteFast(OLED_CS, OLED_CS_ACTIVE);
   SPI_send(SH1106_data_start_seq, sizeof(SH1106_data_start_seq));
@@ -159,7 +173,7 @@ void SH1106_128x64_Driver::Clear() {
 
 /*static*/
 void SH1106_128x64_Driver::SendPage(uint_fast8_t index, const uint8_t *data) {
-  SH1106_data_start_seq[2] = 0xb0 | index;
+  SH1106_data_start_seq[3] = 0xb0 | index;
 
   digitalWriteFast(OLED_DC, LOW); // U8G_ESC_ADR(0),           /* instruction mode */
   digitalWriteFast(OLED_CS, OLED_CS_ACTIVE); // U8G_ESC_CS(1),             /* enable chip */
@@ -224,5 +238,5 @@ void SH1106_128x64_Driver::SPI_send(void *bufr, size_t n) {
 
 /*static*/
 void SH1106_128x64_Driver::AdjustOffset(uint8_t offset) {
-  SH1106_data_start_seq[1] = offset; // lower 4 bits of col adr
+  SH1106_data_start_seq[2] = offset; // lower 4 bits of col adr
 }
