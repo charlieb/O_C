@@ -673,7 +673,17 @@ bool generate_round(int length, int voices, float offset_beats,
                     Rng& rng, Round* out) {
   Round raw = generate_random_round(length, offset_beats, scale, scale_len,
                                     max_beats, rest_probability, rng);
-  return conform_round(raw, voices, -1.0f, scale, scale_len, 40.0f, 20000,
+  // A fixed canon offset is a user intent, not a suggestion: conform at
+  // exactly that offset. Values that cannot land inside the cycle
+  // (>= total, or <= 0) are clamped to half the cycle, as the applet
+  // documents; a negative offset stays auto (the solver picks the
+  // offset needing the fewest changes).
+  float offset = offset_beats;
+  if (offset >= 0.0f) {
+    const float total = raw.total_beats();
+    if (offset <= 0.0f || offset >= total) offset = total * 0.5f;
+  }
+  return conform_round(raw, voices, offset, scale, scale_len, 40.0f, 20000,
                        interval_weights, out);
 }
 

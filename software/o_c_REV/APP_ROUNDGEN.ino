@@ -37,7 +37,7 @@
 // Firmware revision, shown in the menu title bar (right column) and in
 // the app list (OC_apps.ino): check for "v16" after flashing to confirm
 // the build is installed.
-#define ROUNDGEN_VERSION "v19"
+#define ROUNDGEN_VERSION "v21"
 
 #include "OC_digital_inputs.h"
 #include "src/roundgen/roundgen_core.hpp"
@@ -259,15 +259,14 @@ void RoundgenApp::generate_new_round(uint16_t seed) {
   float rests = get_rest_setting() / 100.0f;
   // write into a non-playing slot, then publish the pointer
   roundgen::Round& next = *slot_a_;
-  // conform can fail for a fixed offset >= cycle length; retry with the
-  // next seed a few times before giving up (leaves the previous round).
+  // A fixed canon offset is honored by the core (conform solves at
+  // exactly that offset; values that cannot land inside the cycle are
+  // clamped to half of it there). Conforming at a fixed offset can
+  // still fail for a given melody — retry with the next seed a few
+  // times before giving up (leaves the previous round).
   for (int attempt = 0; attempt < 8; ++attempt) {
     if (roundgen::generate_round(length, voices, offset, scale, scale_len, 2,
                                  rests, NULL, rng_, &next)) {
-      // clamp a fixed offset into the cycle
-      float total = next.total_beats();
-      if (next.offset_beats <= 0.0f || next.offset_beats >= total)
-        next.offset_beats = total * 0.5f;
       publish(next);
       return;
     }
@@ -320,11 +319,19 @@ struct {
   menu::ScreenCursor<menu::kScreenLines> cursor;
 } roundgen_app_state;
 
-// Screensaver monitor state. Last drawn melody step per voice;
-// trigger-flash countdown, decremented once per ~1 ms redraw.
-static int8_t monitor_last_step[8] = {
-    -1, -1, -1, -1, -1, -1, -1, -1};
-static uint8_t monitor_flash[8];
+// Screensaver monitor state (v21). The '*' note-start flash is
+// event-based: a row flashes when its voice's note actually starts
+// sounding on its output channel (the channel's gate opens — a rest
+// becoming a note — or its pitch key changes, where the key is
+// midi+12*voice-octave, the part of the CV that is per-voice), and the
+// event is attributed to the voice owning the channel slot — at most
+// one voice per channel at a time.
+// The tracker mirrors the ISR's channel state: it persists across
+// mutation publishes (like the engine's gate/pitch memory, which only
+// a real reset clears) and is re-armed when the screensaver appears.
+static int16_t monitor_last_cv[2] = { -1, -1 };  // pitch key, or -1 =
+                                               // rest / gate closed
+static uint8_t monitor_flash[8];  // countdown, ~1 ms per decrement
 
 // ---------------------------------------------------------------------------
 // ISR: 16.666 kHz. Reads inputs, advances the beat and drives the DACs at
@@ -584,8 +591,9 @@ void ROUNDGEN_handleAppEvent(OC::AppEvent event) {
     case OC::APP_EVENT_RESUME:
     case OC::APP_EVENT_SCREENSAVER_ON:
     case OC::APP_EVENT_SCREENSAVER_OFF:
-      // (monitor state is static-initialized; a stale step match at
-      // worst delays one trigger flash by a note)
+      // the event tracker keeps its last channel state across menu
+      // time; at worst the first note shown after the screensaver
+      // appears blinks once (the tracker re-syncs on its first update)
       break;
   }
 }
@@ -697,12 +705,12 @@ void ROUNDGEN_menu() {
     if (current == ROUNDGEN_SETTING_OFFSET) {
       // The row always shows what is actually playing: 0 = auto (the
       // solver picks the offset), and fixed offsets that fall outside
-      // the cycle length get clamped at generation — so the raw
-      // setting and the sound can differ. The title bar shows the
-      // same resolved value.
-      int shown = roundgen_app.get_value(ROUNDGEN_SETTING_OFFSET);
-      if (shown == 0 && roundgen_app.playing()->n > 0)
-        shown = static_cast<int>(roundgen_app.playing()->offset_beats);
+      // the cycle length get clamped to half of it at generation — so
+      // the raw setting and the sound can differ, and the row shows
+      // the sound.
+      int shown = static_cast<int>(roundgen_app.playing()->offset_beats);
+      if (roundgen_app.playing()->n == 0)
+        shown = roundgen_app.get_value(ROUNDGEN_SETTING_OFFSET);
       list_item.DrawDefault(shown, RoundgenApp::value_attr(current));
     } else if (current == ROUNDGEN_SETTING_OCT_SEL) {
       // the Oct row shows/edits the SELECTED voice's octave
@@ -730,15 +738,15 @@ void ROUNDGEN_menu() {
 }
 
 // ---------------------------------------------------------------------------
-// Screensaver: live voice monitor (v13). The framework redraws the
+// Screensaver: live voice monitor. The framework redraws the
 // screensaver every ~1 ms, so this tracks the music in real time. One
 // row per voice:
 //   "*V2B C4"     - '*' flashes ~120 ms when the voice starts a note
-//                   (the gate trigger), then the voice number + the
-//                   output channel it is routed to (A/B, '-' = off)
-//   " V1A C4 01/12" - voice 1 is always listed and additionally shows
-//                   the melody step it is on (NN/NN = which note of
-//                   the round is sounding)
+//                   (a note start event on its channel: the gate
+//                   opens or the pitch key changes), then the voice
+//                   number + the output channel it is routed to
+//                   (A/B, '-' = off)
+//   " V1A C4"     - voice 1 is always listed
 // Voices routed to 'off' are skipped, except voice 1.
 // ---------------------------------------------------------------------------
 
@@ -761,12 +769,43 @@ void ROUNDGEN_screensaver() {
   const float total = round->total_beats();
   const float pos = roundgen_app.pos_;
   const float offset = round->offset_beats;
+
+  // Channel map and the voice owning each channel's current slot this
+  // redraw (same slot math as the ISR's note section; -1 = none). The
+  // per-voice rows reuse their own melody walk for the event check.
+  int ch_voices[2][8];
+  int ch_n[2] = { 0, 0 };
+  int slot_owner[2] = { -1, -1 };
+  int8_t ch_of[8];  // each voice's channel, cached for the row pass
+  for (int v = 0; v < 8; ++v) {
+    const int c = roundgen_app.get_voice_chan(v);
+    ch_of[v] = (int8_t)c;
+    if (c < 2) ch_voices[c][ch_n[c]++] = v;
+  }
+  for (int ch = 0; ch < 2; ++ch) {
+    const int kv = ch_n[ch];
+    if (kv == 1) {
+      slot_owner[ch] = ch_voices[ch][0];
+    } else if (kv > 1) {
+      const int beat = (int)pos;
+      const float slot = 1.0f / kv;
+      int m = (int)((pos - beat) / slot);
+      if (m >= kv) m = kv - 1;
+      slot_owner[ch] = ch_voices[ch][m];
+    }
+    // a channel with no voices simply has no owner: the tracker stays
+    // as it was (the engine's pitch memory does the same)
+  }
+
+  // The tracker persists across mutation publishes exactly like the
+  // engine's gate/pitch memory (only a real reset clears it), so the
+  // new round's first notes flash iff the engine actually writes them.
+
   int row = 0;
   for (int v = 0; v < 8; ++v) {
-    const int chan = roundgen_app.get_voice_chan(v);
+    const int chan = ch_of[v];
     if (v > 0 && chan == 2) continue;  // routed voices only; V1 always
-    // voice v plays the melody at pos + v*offset (cyclic); walk to the
-    // note sounding at t
+    // the voice's own melody position (pos + v*offset, cyclic)
     float t = pos + v * offset;
     while (t >= total) t -= total;
     int step = 0;
@@ -776,10 +815,20 @@ void ROUNDGEN_screensaver() {
       acc += round->notes[i].beats;
     }
     const int midi = round->notes[step].midi;
-    if (monitor_last_step[v] != step) {
-      // moved to a new step: a sounding note means the gate fired
-      if (monitor_last_step[v] >= 0 && midi >= 0) monitor_flash[v] = 120;
-      monitor_last_step[v] = (int8_t)step;
+    if (chan < 2 && v == slot_owner[chan]) {
+      // this voice is the one the channel is sounding right now: a note
+      // start event on the channel belongs to it and flashes its row.
+      // The tracker key is the pitch key midi+12*voice-octave, with -1
+      // standing for a closed gate (rest): a rest->note always fires
+      // (the gate opens) and an equal pitch across a rest still counts,
+      // exactly like the engine's gate.
+      if (midi >= 0) {
+        const int cv = midi + 12 * roundgen_app.get_voice_oct(v);
+        if (cv != monitor_last_cv[chan]) monitor_flash[v] = 120;
+        monitor_last_cv[chan] = cv;
+      } else {
+        monitor_last_cv[chan] = -1;
+      }
     }
     graphics.setPrintPos(0, row * 8);
     graphics.print(monitor_flash[v] ? '*' : ' ');
@@ -790,16 +839,6 @@ void ROUNDGEN_screensaver() {
       monitor_note_name(midi);
     else
       graphics.print("R");
-    if (v == 0) {
-      // voice 1 also shows the melody step: NN/NN
-      graphics.print(' ');
-      const int st = step + 1;
-      if (st < 10) graphics.print('0');
-      graphics.print(st);
-      graphics.print('/');
-      if (n < 10) graphics.print('0');
-      graphics.print(n);
-    }
     ++row;
     if (monitor_flash[v]) --monitor_flash[v];
   }
