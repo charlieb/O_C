@@ -21,8 +21,9 @@
 //   offset)
 //
 // Buttons: L = rerandomize (new round), R = menu select / edit (press
-// on the Rerandomize row to fire it). U/D are unused since v22 (they
-// used to step the seed, which is gone). Freeze is TR3 only.
+// on the Rerandomize row to fire it). D toggles the mutation freeze
+// (v25 — TR3 held does the same; both show FRZ in the title bar and on
+// the monitor). U is unused since v22 (it stepped the seed).
 // Encoders: L = mutation rate (live), R = menu scroll / edit.
 //
 // Menu: Scale, Key, Voices (2..8), Melody len (8..24), Canon off
@@ -48,12 +49,16 @@
 // lets the whole 1..7 range fit the DAC's 10-octave pitch window (see
 // ROUNDGEN_PITCH_ZERO_MIDI), and the screensaver now shows each voice's
 // sounded note (the melody note transposed to its octave).
+// v25 adds the Down-button freeze: a press latches the mutation freeze
+// that TR3 applies while held (the effective state is either — see
+// frozen()), and the state is shown as FRZ in the title bar and on
+// voice 1's monitor row.
 
 // Firmware revision, shown in the menu title bar (right column): check
-// for "v24" after flashing to confirm the build is installed. (The app
+// for "v25" after flashing to confirm the build is installed. (The app
 // list carries the bare name "Roundgen" — no version to lag this
 // string; the title bar is the one this build controls.)
-#define ROUNDGEN_VERSION "v24"
+#define ROUNDGEN_VERSION "v25"
 
 // Gate mode with an external clock: no accepted TR1 pulse for this long
 // (~1 kHz sections, i.e. ~4 s = 15 BPM at 1 PPQN) means the tempo is
@@ -206,6 +211,9 @@ public:
     return get_voice_oct(v) + ROUNDGEN_MELODY_OCTAVE;
   }
 
+  // the effective mutation freeze: TR3 held, or the Down-button latch
+  bool frozen() const { return freeze_ || freeze_toggle_; }
+
   void Init();
   // A new round, same settings: drawn from the continuous RNG stream,
   // so every call sounds a different melody (menu Rerandomize row, TR4,
@@ -219,7 +227,11 @@ public:
   volatile uint32_t clocked_accum_;  // consumed ONLY by the ~1 kHz ISR
                                     // section (beat advance, TR2 reset)
   volatile bool reroll_pending_;    // TR4 edge latched for loop()
-  volatile bool freeze_;
+  volatile bool freeze_;            // TR3 held (written by the ISR)
+  // Down-button freeze latch (v25): a button press toggles it, it is
+  // not stored in EEPROM. The effective freeze is freeze_ (TR3, held)
+  // OR this latch — see frozen().
+  bool freeze_toggle_;
   // Set by a reset (TR2, or boot): the ~1 kHz ISR section actively
   // reinitializes the note-tracker state (drops any held gate, clears
   // the boundary/pitch caches) so the round restarts cleanly at beat 0
@@ -265,6 +277,7 @@ void RoundgenApp::Init() {
   clocked_accum_ = 0;
   reroll_pending_ = false;
   freeze_ = false;
+  freeze_toggle_ = false;
   note_reset_pending_ = false;
   pending_publish_ = false;
   gate_opens_[0] = 0;
@@ -808,7 +821,7 @@ void ROUNDGEN_loop() {
   // during the solve (the "ignoring several external clocks" / ragged
   // internal tempo bugs) — so the new melody only ever starts exactly
   // on a boundary, no matter how long the solve took.
-  if (!app.freeze_ && app.get_mutation_setting() > 0 && app.playing()->n > 0) {
+  if (!app.frozen() && app.get_mutation_setting() > 0 && app.playing()->n > 0) {
     static int last_cycle = 0;
     int cycle = app.cycle_;
     if (cycle != last_cycle) {
@@ -851,13 +864,25 @@ void ROUNDGEN_loop() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The mutation freeze tag (v25): drawn by the menu (ahead of the revision)
+// and by the monitor (right of voice 1's row, the first row). A function,
+// not an inline test at both sites: the frozen() check and the tag text
+// then exist once — and flash is at the ceiling.
+// ---------------------------------------------------------------------------
+static void roundgen_freeze_tag() {
+  if (roundgen_app.frozen()) graphics.print("FRZ ");
+}
+
 void ROUNDGEN_menu() {
   menu::DualTitleBar::Draw();
   graphics.print("Roundgen");
   menu::DualTitleBar::SetColumn(1);
-  // just the revision — the canon offset is shown resolved on its own
-  // menu row (Canon off), and the cycle counter is a mutation detail
-  // that belongs in the monitor, not the menu
+  // the revision, with the freeze tag ahead of it (v25); the canon
+  // offset is shown resolved on its own menu row (Canon off), and the
+  // cycle counter is a mutation detail that belongs in the monitor,
+  // not the menu
+  roundgen_freeze_tag();
   graphics.print(ROUNDGEN_VERSION);
   // The row count depends on the clock source (BPM only exists under
   // the internal clock): keep the cursor's end in sync. A row past the
@@ -914,7 +939,8 @@ void ROUNDGEN_menu() {
 //                   (A/B, '-' = off)
 //   " V1A C4"     - voice 1 is always listed
 // The note shown is the one the voice is *sounding*: the melody note
-// transposed to its octave setting (v24).
+// transposed to its octave setting (v24). While mutation is frozen,
+// voice 1's row is followed by FRZ (v25).
 // Voices routed to 'off' are skipped, except voice 1.
 // ---------------------------------------------------------------------------
 
@@ -1018,6 +1044,11 @@ void ROUNDGEN_screensaver() {
     ++row;
     if (monitor_flash[v]) --monitor_flash[v];
   }
+  // the freeze tag, right of voice 1's row (v25). Called after the row
+  // loop on purpose: a call inside it costs ~40 bytes of register spills
+  // alone (flash is at the ceiling).
+  graphics.setPrintPos(96, 0);
+  roundgen_freeze_tag();
 }
 
 void ROUNDGEN_leftButton() {
@@ -1037,9 +1068,14 @@ void ROUNDGEN_rightButton() {
 void ROUNDGEN_handleButtonEvent(const UI::Event &event) {
   if (UI::EVENT_BUTTON_PRESS == event.type) {
     switch (event.control) {
-      // UP/DOWN are unused since v22 (they stepped the seed, now gone)
+      // UP is unused since v22 (it stepped the seed, now gone)
       case OC::CONTROL_BUTTON_L: ROUNDGEN_leftButton(); break;
       case OC::CONTROL_BUTTON_R: ROUNDGEN_rightButton(); break;
+      // Down toggles the mutation freeze (v25); TR3 freezes while held,
+      // and both states show FRZ (title bar + monitor)
+      case OC::CONTROL_BUTTON_DOWN:
+        roundgen_app.freeze_toggle_ = !roundgen_app.freeze_toggle_;
+        break;
     }
   }
 }
